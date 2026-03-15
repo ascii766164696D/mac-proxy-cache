@@ -1,6 +1,7 @@
 # Mac Proxy Cache
 
-<img src="docs/menubar.png" width="350" alt="Menu bar app screenshot">
+<img src="docs/menubar.png" width="250" alt="Menu bar app screenshot">
+<img src="docs/monitor.png" width="1050" alt="Monitor window screenshot">
 
 A macOS caching proxy server with a native menu bar app and a browsable media cache. Intercepts HTTP/HTTPS traffic via MITM, caches responses locally with proper file names and extensions, and serves them on subsequent requests. Browse your cached images and videos directly in Finder.
 
@@ -45,7 +46,7 @@ Open it in Finder — images show thumbnails, Quick Look works on everything. Re
 
 ## Monitor
 
-<img src="assets/monitor.png" width="750" alt="Monitor window screenshot">
+<img src="docs/monitor.png" width="750" alt="Monitor window screenshot">
 
 The monitor window shows live request activity with a traffic chart, cache hit indicators, and filters. Double-click any cached entry to reveal it in Finder.
 
