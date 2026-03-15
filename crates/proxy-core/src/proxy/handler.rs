@@ -505,11 +505,17 @@ impl HttpHandler for CachingHandler {
             }
         }
 
-        // Don't cache responses that Vary on Origin — they're CORS-sensitive and
-        // we skip serving them from cache anyway. Returning directly also avoids
-        // the streaming tee which can corrupt compressed bodies.
+        // Don't cache CORS-sensitive responses:
+        // 1. Responses that Vary on Origin
+        // 2. Responses with a specific Access-Control-Allow-Origin (not "*")
+        // These would break when served to a different origin.
         if let Some(vary) = res.headers().get(header::VARY).and_then(|v| v.to_str().ok()) {
             if vary.to_lowercase().contains("origin") {
+                return maybe_count(res);
+            }
+        }
+        if let Some(acao) = res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).and_then(|v| v.to_str().ok()) {
+            if acao != "*" {
                 return maybe_count(res);
             }
         }

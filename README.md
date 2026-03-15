@@ -43,6 +43,12 @@ Cached files are stored in a **browsable directory tree** at `~/mac-proxy-cache/
 
 Open it in Finder — images show thumbnails, Quick Look works on everything. Responses are decompressed (gzip/deflate stripped) before storing so files are directly viewable.
 
+## Monitor
+
+<img src="assets/monitor.png" width="750" alt="Monitor window screenshot">
+
+The monitor window shows live request activity with a traffic chart, cache hit indicators, and filters. Double-click any cached entry to reveal it in Finder.
+
 ## Menu Bar App
 
 The native macOS menu bar app shows live stats and provides quick controls:
