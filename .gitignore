@@ -1,0 +1,11 @@
+/target
+data/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.idea
+.claude/
+PLAN.md
+app/.build/
+app/.swiftpm/
