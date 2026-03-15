@@ -139,9 +139,22 @@ These connections are tunneled directly without MITM to avoid certificate pinnin
 - HLS/DASH segments are cached as normal files (natural URL structure)
 - YouTube URL normalization strips ephemeral tokens for stable cache keys
 
-## Building
+## Prerequisites
 
-Requires: Rust 1.85+, Swift 5.9+, macOS 13+
+- **macOS 13+** (Ventura or later)
+- **Rust** — install via [rustup](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **Xcode Command Line Tools** — `xcode-select --install` (provides Swift compiler and system headers)
+- **CMake** — required by `aws-lc-sys` (TLS crypto): `brew install cmake`
+
+Verify your setup:
+
+```bash
+rustc --version    # 1.85+
+swift --version    # 5.9+
+cmake --version    # 3.x+
+```
+
+## Building
 
 ```bash
 # Build everything
