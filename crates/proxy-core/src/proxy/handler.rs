@@ -23,11 +23,30 @@ const PASSTHROUGH_DOMAINS: &[&str] = &[
     "ocsp2.apple.com",
 ];
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
 use crate::cache::index::{CacheEntry, CacheIndex};
 use crate::cache::key;
 use crate::cache::policy::CachedPolicy;
 use crate::cache::range::{self, ContentRange, RangeCache, SlabHit};
 use crate::cache::store;
+
+/// A logged request/response for the live monitor.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RequestLogEntry {
+    pub id: u64,
+    pub timestamp: i64,
+    pub method: String,
+    pub url: String,
+    pub status_code: u16,
+    pub size: i64,
+    pub from_cache: bool,
+    pub content_type: Option<String>,
+    pub host: String,
+    /// Relative path in cache dir, if cached on disk
+    pub file_path: Option<String>,
+}
 
 /// Shared state across all handler clones.
 pub struct ProxyState {
@@ -45,9 +64,28 @@ pub struct ProxyState {
     pub cache_misses: AtomicU64,
     pub bytes_saved: AtomicU64,
     pub touch_tx: mpsc::UnboundedSender<(String, i64)>,
+    pub request_log: Mutex<VecDeque<RequestLogEntry>>,
+    pub request_log_counter: AtomicU64,
 }
 
 impl ProxyState {
+    pub fn log_request(&self, entry: RequestLogEntry) {
+        if let Ok(mut log) = self.request_log.lock() {
+            log.push_back(entry);
+            while log.len() > 2000 {
+                log.pop_front();
+            }
+        }
+    }
+
+    pub fn get_requests_since(&self, since_id: u64) -> Vec<RequestLogEntry> {
+        if let Ok(log) = self.request_log.lock() {
+            log.iter().filter(|e| e.id > since_id).cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn stats(&self) -> ProxyStats {
         ProxyStats {
             requests: self.requests.load(Ordering::Relaxed),
@@ -227,7 +265,21 @@ impl HttpHandler for CachingHandler {
                     let _ = self.state.touch_tx.send((fingerprint, now_unix()));
 
                     match serve_from_cache(&self.state.cache_dir, &entry) {
-                        Ok(response) => return response.into(),
+                        Ok(response) => {
+                            self.state.log_request(RequestLogEntry {
+                                id: self.state.request_log_counter.fetch_add(1, Ordering::Relaxed),
+                                timestamp: now_unix(),
+                                method: method.clone(),
+                                url: uri.clone(),
+                                status_code: entry.status_code,
+                                size: entry.file_size,
+                                from_cache: true,
+                                content_type: entry.content_type.clone(),
+                                host: entry.host.clone(),
+                                file_path: Some(entry.file_path.clone()),
+                            });
+                            return response.into();
+                        }
                         Err(e) => tracing::warn!(uri = %uri, "Cache read failed: {}", e),
                     }
                 }
@@ -279,7 +331,11 @@ impl HttpHandler for CachingHandler {
         }
 
         // Apple services (hard cert pinning)
-        if host.ends_with(".apple.com") || host.ends_with(".icloud.com") {
+        if host.ends_with(".apple.com")
+            || host.ends_with(".icloud.com")
+            || host.ends_with(".mzstatic.com")
+            || host.ends_with(".itunes.apple.com")
+        {
             return false;
         }
 
@@ -295,6 +351,34 @@ impl HttpHandler for CachingHandler {
         let method = &self.req_ctx.method;
         let uri = self.req_ctx.uri.clone();
         let status = res.status();
+
+        // Log every response to the request monitor
+        let response_ct = res.headers().get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let response_cl = res.headers().get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let host = url::Url::parse(&uri).ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        // Check if this URL is already cached on disk
+        let cached_file = if self.req_ctx.should_cache {
+            self.state.cache_index.lookup(&self.req_ctx.fingerprint).await
+                .ok().flatten().map(|e| e.file_path)
+        } else {
+            None
+        };
+        self.state.log_request(RequestLogEntry {
+            id: self.state.request_log_counter.fetch_add(1, Ordering::Relaxed),
+            timestamp: now_unix(),
+            method: method.clone(),
+            url: uri.clone(),
+            status_code: status.as_u16(),
+            size: response_cl,
+            from_cache: false,
+            content_type: response_ct,
+            host,
+            file_path: cached_file,
+        });
 
         // Handle unsafe method invalidation (POST/PUT/DELETE)
         if matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH") && status.is_success() {
@@ -317,13 +401,16 @@ impl HttpHandler for CachingHandler {
                     .bytes_saved
                     .fetch_add(entry.file_size as u64, Ordering::Relaxed);
 
-                // Update cache policy with new response headers
-                let headers_json = extract_headers_json(&res);
-                let policy_bytes = build_cache_policy_bytes(&uri, &headers_json);
+                // Merge 304 headers into existing stored headers.
+                // A 304 may only include a subset of headers (freshness-related).
+                // We must keep the original body-related headers (content-type,
+                // content-encoding, etc.) since the cached body hasn't changed.
+                let merged = merge_304_headers(&entry.response_headers, &res);
+                let policy_bytes = build_cache_policy_bytes(&uri, &merged);
                 let _ = self
                     .state
                     .cache_index
-                    .update_policy(&fingerprint, policy_bytes, &headers_json)
+                    .update_policy(&fingerprint, policy_bytes, &merged)
                     .await;
 
                 match serve_from_cache(&self.state.cache_dir, entry) {
@@ -388,7 +475,16 @@ impl HttpHandler for CachingHandler {
             }
         }
 
-        // Track content-encoding so we can decompress when writing to disk
+        // Don't cache responses that Vary on Origin — they're CORS-sensitive and
+        // we skip serving them from cache anyway. Returning directly also avoids
+        // the streaming tee which can corrupt compressed bodies.
+        if let Some(vary) = res.headers().get(header::VARY).and_then(|v| v.to_str().ok()) {
+            if vary.to_lowercase().contains("origin") {
+                return res;
+            }
+        }
+
+        // Track content-encoding for decompressing when writing to disk cache
         let content_encoding = res
             .headers()
             .get(header::CONTENT_ENCODING)
@@ -491,13 +587,13 @@ impl HttpHandler for CachingHandler {
                 }
             }
 
-            // Decompress if content-encoded, so files are viewable in Finder
-            let was_encoded = ce.is_some();
-            let cache_buf = decompress_body(cache_buf, ce.as_deref());
+            // Decompress for disk storage so files are viewable in Finder.
+            // The client already got the original (possibly compressed) body via the tee.
+            let (cache_buf, was_decompressed) = decompress_body(cache_buf, ce.as_deref());
 
-            // If we decompressed, strip content-encoding from stored headers
-            // so the browser doesn't try to decompress again on cache hit
-            let hj = if was_encoded {
+            // Strip encoding headers from stored JSON if we decompressed,
+            // so cache HITs serve decompressed content without encoding header.
+            let hj = if was_decompressed {
                 strip_encoding_headers(&hj)
             } else {
                 hj
@@ -714,7 +810,7 @@ fn serve_from_cache(
                 if let Some(v) = value.as_str() {
                     if let (Ok(name), Ok(val)) = (
                         http::header::HeaderName::from_bytes(name.as_bytes()),
-                        http::header::HeaderValue::from_str(v),
+                        http::header::HeaderValue::from_bytes(v.as_bytes()),
                     ) {
                         builder = builder.header(name, val);
                     }
@@ -737,12 +833,15 @@ fn serve_from_cache(
 fn extract_headers_json(res: &Response<Body>) -> String {
     let mut header_map = serde_json::Map::new();
     for (name, value) in res.headers() {
-        if let Ok(v) = value.to_str() {
-            header_map.insert(
-                name.as_str().to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-        }
+        // Use to_str() for visible ASCII, fall back to lossy for binary headers
+        let v = match value.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => String::from_utf8_lossy(value.as_bytes()).to_string(),
+        };
+        header_map.insert(
+            name.as_str().to_string(),
+            serde_json::Value::String(v),
+        );
     }
     serde_json::Value::Object(header_map).to_string()
 }
@@ -779,6 +878,41 @@ fn build_cache_policy_bytes(url: &str, headers_json: &str) -> Vec<u8> {
     serde_json::to_vec(&policy).unwrap_or_default()
 }
 
+/// Merge headers from a 304 response into existing stored headers.
+/// Only updates freshness/validation headers; preserves body-related headers
+/// (content-type, content-encoding, content-length) from the original response.
+fn merge_304_headers(existing_json: &str, res_304: &Response<Body>) -> String {
+    // Headers that a 304 can legitimately update (RFC 7232 §4.1)
+    const UPDATABLE: &[&str] = &[
+        "cache-control",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "vary",
+        "set-cookie",
+        "strict-transport-security",
+        "x-github-request-id",
+    ];
+
+    let mut stored: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(existing_json).unwrap_or_default();
+
+    for (name, value) in res_304.headers() {
+        let key = name.as_str().to_lowercase();
+        if UPDATABLE.contains(&key.as_str()) {
+            let v = match value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => String::from_utf8_lossy(value.as_bytes()).to_string(),
+            };
+            stored.insert(key, serde_json::Value::String(v));
+        }
+    }
+
+    serde_json::to_string(&serde_json::Value::Object(stored))
+        .unwrap_or_else(|_| existing_json.to_string())
+}
+
 /// Strip content-encoding and content-length from stored headers JSON.
 /// Called after decompression so cached responses don't claim to be compressed.
 fn strip_encoding_headers(headers_json: &str) -> String {
@@ -795,10 +929,11 @@ fn strip_encoding_headers(headers_json: &str) -> String {
 }
 
 /// Decompress body bytes based on Content-Encoding.
-/// Returns original bytes if not compressed or decompression fails.
-fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Vec<u8> {
+/// Returns (body, was_decompressed). If decompression fails or encoding
+/// is unsupported, returns original bytes with was_decompressed=false.
+fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> (Vec<u8>, bool) {
     let Some(enc) = encoding else {
-        return body;
+        return (body, false);
     };
 
     match enc {
@@ -807,8 +942,8 @@ fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Vec<u8> {
             let mut decoder = flate2::read::GzDecoder::new(&body[..]);
             let mut decoded = Vec::new();
             match decoder.read_to_end(&mut decoded) {
-                Ok(_) => decoded,
-                Err(_) => body,
+                Ok(_) => (decoded, true),
+                Err(_) => (body, false),
             }
         }
         "deflate" => {
@@ -816,13 +951,21 @@ fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Vec<u8> {
             let mut decoder = flate2::read::DeflateDecoder::new(&body[..]);
             let mut decoded = Vec::new();
             match decoder.read_to_end(&mut decoded) {
-                Ok(_) => decoded,
-                Err(_) => body,
+                Ok(_) => (decoded, true),
+                Err(_) => (body, false),
             }
         }
-        // brotli and zstd: fall back to storing compressed
-        // (could add brotli/zstd crates later)
-        _ => body,
+        "br" => {
+            use std::io::Read;
+            let mut decoded = Vec::new();
+            let mut decoder = brotli::Decompressor::new(&body[..], 4096);
+            match decoder.read_to_end(&mut decoded) {
+                Ok(_) => (decoded, true),
+                Err(_) => (body, false),
+            }
+        }
+        // zstd and unknown: keep compressed, don't strip headers
+        _ => (body, false),
     }
 }
 

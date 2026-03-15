@@ -69,6 +69,8 @@ pub async fn run(config: &Config) -> Result<(), Error> {
         cache_misses: Default::default(),
         bytes_saved: Default::default(),
         touch_tx,
+        request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        request_log_counter: Default::default(),
     });
 
     // Spawn LRU touch batcher

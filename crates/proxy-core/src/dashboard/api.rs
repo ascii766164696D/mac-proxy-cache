@@ -393,6 +393,19 @@ pub struct MediaEntry {
     pub thumbnail_url: String,
 }
 
+#[derive(Deserialize)]
+pub struct RequestLogParams {
+    pub since: Option<u64>,
+}
+
+pub async fn list_requests(
+    State(state): State<Arc<ProxyState>>,
+    Query(params): Query<RequestLogParams>,
+) -> Json<Vec<crate::proxy::handler::RequestLogEntry>> {
+    let since = params.since.unwrap_or(0);
+    Json(state.get_requests_since(since))
+}
+
 pub async fn list_media(
     State(state): State<Arc<ProxyState>>,
     Query(params): Query<ListParams>,

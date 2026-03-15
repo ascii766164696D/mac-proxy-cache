@@ -24,6 +24,7 @@ pub async fn start(state: Arc<ProxyState>, port: u16) {
         .route("/api/system-proxy", post(api::set_system_proxy))
         .route("/api/config", get(api::get_config).post(api::update_config))
         .route("/api/cache/file/{*path}", get(api::serve_cache_file))
+        .route("/api/requests", get(api::list_requests))
         .route("/api/media", get(api::list_media))
         .layer(
             tower_http::cors::CorsLayer::new()

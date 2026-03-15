@@ -4,6 +4,7 @@ import AppKit
 struct MenuBarView: View {
     @ObservedObject var proxyService: ProxyService
     @ObservedObject var stats: StatsPoller
+    var openMonitor: () -> Void
 
     var body: some View {
         // Status
@@ -72,6 +73,10 @@ struct MenuBarView: View {
         }
 
         // Actions
+        Button("Open Monitor...") {
+            openMonitor()
+        }
+
         Button("Browse Cache in Finder...") {
             let cacheDir = "\(NSHomeDirectory())/mac-proxy-cache/cache"
             NSWorkspace.shared.open(URL(fileURLWithPath: cacheDir))

@@ -44,6 +44,13 @@ fi
 
 stop_all
 
+# --clean flag: clear cache before starting
+if [ "${1:-}" = "--clean" ]; then
+    echo "Clearing cache..."
+    rm -rf "$DATA_DIR/cache" "$DATA_DIR/index.db" "$DATA_DIR/index.db-wal" "$DATA_DIR/index.db-shm"
+    echo "  Cache cleared."
+fi
+
 # --- Build ---
 
 echo ""
