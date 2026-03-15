@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Charts
 
 struct RequestEntry: Identifiable, Decodable {
     let id: UInt64
@@ -95,6 +96,14 @@ class MonitorViewModel: ObservableObject {
     }
 }
 
+struct ActivityBucket: Identifiable {
+    let id: Int // second offset
+    let second: Int
+    let date: Date
+    let hits: Int
+    let misses: Int
+}
+
 struct MonitorWindow: View {
     @StateObject private var vm = MonitorViewModel()
     @State private var selection = Set<UInt64>()
@@ -103,8 +112,35 @@ struct MonitorWindow: View {
     @State private var filterCached = false
     @State private var filterOnDisk = false
     @State private var filterType = "All"
+    @State private var chartHeight: CGFloat = 80
 
     private let typeOptions = ["All", "image", "video", "audio", "javascript", "css", "json", "html", "font"]
+    private let chartWindow = 60 // seconds
+
+    private var activityBuckets: [ActivityBucket] {
+        let now = Int(Date().timeIntervalSince1970)
+        let cutoff = now - chartWindow
+        var hitsBySecond = [Int: Int]()
+        var missesBySecond = [Int: Int]()
+        for e in vm.entries where e.timestamp >= cutoff {
+            let sec = e.timestamp - cutoff
+            if e.from_cache {
+                hitsBySecond[sec, default: 0] += 1
+            } else {
+                missesBySecond[sec, default: 0] += 1
+            }
+        }
+        return (0..<chartWindow).map { sec in
+            let ts = cutoff + sec
+            return ActivityBucket(
+                id: sec,
+                second: sec,
+                date: Date(timeIntervalSince1970: TimeInterval(ts)),
+                hits: hitsBySecond[sec] ?? 0,
+                misses: missesBySecond[sec] ?? 0
+            )
+        }
+    }
 
     private var filteredEntries: [RequestEntry] {
         var result = vm.entries
@@ -160,6 +196,83 @@ struct MonitorWindow: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(.bar)
+
+            // Activity chart
+            Chart(activityBuckets) { bucket in
+                BarMark(
+                    x: .value("Time", bucket.date, unit: .second),
+                    y: .value("Requests", bucket.misses)
+                )
+                .foregroundStyle(Color.blue.opacity(0.6))
+
+                BarMark(
+                    x: .value("Time", bucket.date, unit: .second),
+                    y: .value("Requests", bucket.hits)
+                )
+                .foregroundStyle(Color.green.opacity(0.8))
+            }
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .second, count: 10)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2]))
+                        .foregroundStyle(.secondary.opacity(0.2))
+                    AxisValueLabel(format: .dateTime.hour().minute().second())
+                        .font(.system(size: 8))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .leading) { value in
+                    if let v = value.as(Int.self), v > 0 {
+                        AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2]))
+                            .foregroundStyle(.secondary.opacity(0.3))
+                        AxisValueLabel {
+                            Text("\(v)")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .chartLegend(.hidden)
+            .chartYScale(domain: .automatic(includesZero: true))
+            .frame(height: chartHeight)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background(.bar)
+            .overlay(alignment: .topTrailing) {
+                HStack(spacing: 8) {
+                    HStack(spacing: 3) {
+                        Circle().fill(Color.blue.opacity(0.6)).frame(width: 6, height: 6)
+                        Text("Internet").font(.system(size: 9)).foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 3) {
+                        Circle().fill(Color.green.opacity(0.8)).frame(width: 6, height: 6)
+                        Text("Cache").font(.system(size: 9)).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.trailing, 12)
+                .padding(.top, 4)
+            }
+
+            // Draggable divider
+            Rectangle()
+                .fill(Color.secondary.opacity(0.2))
+                .frame(height: 5)
+                .contentShape(Rectangle())
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.resizeUpDown.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { value in
+                            let newHeight = chartHeight + value.translation.height
+                            chartHeight = max(30, min(300, newHeight))
+                        }
+                )
 
             // Request table
             Table(filteredEntries, selection: $selection, sortOrder: $sortOrder) {

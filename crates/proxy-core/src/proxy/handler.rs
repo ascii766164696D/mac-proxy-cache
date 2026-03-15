@@ -78,6 +78,25 @@ impl ProxyState {
         }
     }
 
+    pub fn update_request_size(&self, id: u64, size: i64) {
+        if let Ok(mut log) = self.request_log.lock() {
+            if let Some(entry) = log.iter_mut().rev().find(|e| e.id == id) {
+                entry.size = size;
+            }
+        }
+    }
+
+    pub fn update_request_cache_hit(&self, id: u64, size: i64, status_code: u16, file_path: Option<String>) {
+        if let Ok(mut log) = self.request_log.lock() {
+            if let Some(entry) = log.iter_mut().rev().find(|e| e.id == id) {
+                entry.from_cache = true;
+                entry.size = size;
+                entry.status_code = status_code;
+                entry.file_path = file_path;
+            }
+        }
+    }
+
     pub fn get_requests_since(&self, since_id: u64) -> Vec<RequestLogEntry> {
         if let Ok(log) = self.request_log.lock() {
             log.iter().filter(|e| e.id > since_id).cloned().collect()
@@ -187,7 +206,9 @@ impl HttpHandler for CachingHandler {
             }
         }
 
-        let fingerprint = key::compute_fingerprint(&method, &effective_uri, &[]);
+        // Normalize URL for cache key (strips cosmetic query params from static resources)
+        let cache_uri = key::normalize_url(&effective_uri);
+        let fingerprint = key::compute_fingerprint(&method, &cache_uri, &[]);
         self.req_ctx.fingerprint = fingerprint.clone();
         self.req_ctx.should_cache = true;
 
@@ -196,17 +217,13 @@ impl HttpHandler for CachingHandler {
             return req.into();
         }
 
-        // Client no-cache: forward but still cache
+        // Client no-cache / max-age=0: don't serve from cache directly,
+        // but still look up cached entry for revalidation headers (If-None-Match etc.)
         let no_cache = req
             .headers()
             .get(header::CACHE_CONTROL)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("no-cache") || v.contains("max-age=0"));
-
-        if no_cache {
-            self.state.cache_misses.fetch_add(1, Ordering::Relaxed);
-            return req.into();
-        }
 
         // For range requests, check if we have a slab that fully covers the requested range
         if let Some(start) = self.req_ctx.range_start {
@@ -255,7 +272,7 @@ impl HttpHandler for CachingHandler {
                 && entry.response_headers.to_lowercase().contains("origin");
 
             if let Ok(policy) = CachedPolicy::from_bytes(&entry.cache_policy) {
-                if policy.is_fresh() && !varies_on_origin {
+                if policy.is_fresh() && !varies_on_origin && !no_cache {
                     // Fresh hit — serve from cache
                     tracing::info!(uri = %uri, "Cache HIT");
                     self.state.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -285,7 +302,7 @@ impl HttpHandler for CachingHandler {
                 }
             }
 
-            // Stale — add revalidation headers and store entry for 304 handling
+            // Stale or no-cache — add revalidation headers and store entry for 304 handling
             tracing::debug!(uri = %uri, "Cache stale, revalidating");
             self.req_ctx.existing_entry = Some(entry.clone());
 
@@ -367,8 +384,9 @@ impl HttpHandler for CachingHandler {
         } else {
             None
         };
+        let log_id = self.state.request_log_counter.fetch_add(1, Ordering::Relaxed);
         self.state.log_request(RequestLogEntry {
-            id: self.state.request_log_counter.fetch_add(1, Ordering::Relaxed),
+            id: log_id,
             timestamp: now_unix(),
             method: method.clone(),
             url: uri.clone(),
@@ -380,14 +398,21 @@ impl HttpHandler for CachingHandler {
             file_path: cached_file,
         });
 
+        // Helper: wrap response to count body size if Content-Length was missing
+        let needs_size = response_cl == 0;
+        let state_for_size = self.state.clone();
+        let maybe_count = |res: Response<Body>| -> Response<Body> {
+            if needs_size { with_size_counting(state_for_size.clone(), log_id, res) } else { res }
+        };
+
         // Handle unsafe method invalidation (POST/PUT/DELETE)
         if matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH") && status.is_success() {
             self.invalidate_for_unsafe_method(&uri, &res).await;
-            return res;
+            return maybe_count(res);
         }
 
         if !self.req_ctx.should_cache {
-            return res;
+            return maybe_count(res);
         }
 
         let fingerprint = self.req_ctx.fingerprint.clone();
@@ -414,11 +439,16 @@ impl HttpHandler for CachingHandler {
                     .await;
 
                 match serve_from_cache(&self.state.cache_dir, entry) {
-                    Ok(response) => return response,
+                    Ok(response) => {
+                        self.state.update_request_cache_hit(
+                            log_id, entry.file_size, entry.status_code, Some(entry.file_path.clone()),
+                        );
+                        return response;
+                    }
                     Err(e) => tracing::warn!(uri = %uri, "Cache read failed after 304: {}", e),
                 }
             }
-            return res;
+            return maybe_count(res);
         }
 
         // Handle 206 Partial Content — store as range slab
@@ -432,12 +462,12 @@ impl HttpHandler for CachingHandler {
                 tracing::info!(uri = %uri, status = %status, "Origin returned error, marking cache stale");
                 self.mark_entry_stale(entry).await;
             }
-            return res;
+            return maybe_count(res);
         }
 
         // Only cache successful responses
         if !status.is_success() {
-            return res;
+            return maybe_count(res);
         }
 
         // Check cache-control headers
@@ -449,7 +479,7 @@ impl HttpHandler for CachingHandler {
             .and_then(|v| v.to_str().ok())
         {
             if cc.contains("no-store") {
-                return res;
+                return maybe_count(res);
             }
         }
 
@@ -463,7 +493,7 @@ impl HttpHandler for CachingHandler {
             let max_entry = self.state.max_entry_size.load(Ordering::Relaxed);
             if cl > max_entry {
                 tracing::debug!(uri = %uri, size = cl, max = max_entry, "Response too large, skipping cache");
-                return res;
+                return maybe_count(res);
             }
         }
 
@@ -471,7 +501,7 @@ impl HttpHandler for CachingHandler {
         // Only cache static assets (JS, CSS, images, fonts, media, JSON APIs with cache headers).
         if let Some(ct) = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
             if ct.contains("text/html") {
-                return res;
+                return maybe_count(res);
             }
         }
 
@@ -480,7 +510,7 @@ impl HttpHandler for CachingHandler {
         // the streaming tee which can corrupt compressed bodies.
         if let Some(vary) = res.headers().get(header::VARY).and_then(|v| v.to_str().ok()) {
             if vary.to_lowercase().contains("origin") {
-                return res;
+                return maybe_count(res);
             }
         }
 
@@ -560,6 +590,11 @@ impl HttpHandler for CachingHandler {
             ).await;
 
             let body_complete = matches!(tee_result, Ok(true));
+
+            // Update the log entry with actual body size
+            if !cache_buf.is_empty() {
+                state.update_request_size(log_id, cache_buf.len() as i64);
+            }
 
             // Drop sender to signal end of stream to client
             drop(tx);
@@ -967,6 +1002,46 @@ fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> (Vec<u8>, bool) {
         // zstd and unknown: keep compressed, don't strip headers
         _ => (body, false),
     }
+}
+
+/// Wrap a response body to count bytes flowing through it.
+/// Updates the request log entry with the actual size when the body completes.
+fn with_size_counting(
+    state: Arc<ProxyState>,
+    log_id: u64,
+    res: Response<Body>,
+) -> Response<Body> {
+    let (parts, body) = res.into_parts();
+    let (tx, rx) = mpsc::channel::<Result<Frame<bytes::Bytes>, hudsucker::Error>>(32);
+
+    tokio::spawn(async move {
+        let mut total = 0i64;
+        let mut body = body;
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        total += data.len() as i64;
+                    }
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+                None => break,
+            }
+        }
+        if total > 0 {
+            state.update_request_size(log_id, total);
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let stream_body = StreamBody::new(stream);
+    Response::from_parts(parts, Body::from(stream_body))
 }
 
 fn now_unix() -> i64 {
